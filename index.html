@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Investment Portfolio Overview</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- Stops favicon 404 noise -->
+  <link rel="icon" href="data:," />
+
+  <!-- CSV parsing -->
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+
+  <style>
+    body { margin:0; background:#0b1020; color:#e8ecff; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial; }
+    header { padding:20px; border-bottom:1px solid #27325f; }
+    main { max-width:1200px; margin:auto; padding:20px; }
+    .card { background:#121a33; border:1px solid #27325f; border-radius:14px; padding:16px; margin-bottom:16px; }
+    button { background:#0f1630; color:#e8ecff; border:1px solid #27325f; border-radius:10px; padding:10px 14px; cursor:pointer; }
+    button:hover { border-color:#7aa2ff; }
+    input[type=file] { width:100%; padding:10px; background:#0f1630; color:#a7b0d6; border-radius:10px; border:1px dashed #27325f; }
+    table { width:100%; border-collapse:collapse; margin-top:10px; }
+    th, td { padding:8px; border-bottom:1px solid #27325f; font-size:12px; text-align:right; white-space:nowrap; }
+    th:first-child, td:first-child { text-align:left; }
+    .pill { display:inline-block; padding:4px 10px; border-radius:999px; border:1px solid #27325f; font-size:12px; margin-left:10px; }
+    .warn { color:#ffd27a; font-size:12px; white-space:pre-wrap; margin-top:10px; }
+  </style>
+</head>
+
+<body>
+<header>
+  <h1>Investment Portfolio Overview</h1>
+  <p>Upload PDF statements (holdings only) and CSV transactions. All processing stays in your browser.</p>
+</header>
+
+<main>
+  <div class="card">
+    <h2>Upload</h2>
+    <input id="fileInput" type="file" multiple accept=".pdf,.csv" />
+    <br /><br />
+    <button id="processBtn">Process uploads</button>
+    <button id="resetBtn">Reset</button>
+    <span class="pill" id="status">Waiting…</span>
+    <div class="warn" id="warnings"></div>
+  </div>
+
+  <div class="card">
+    <h2>Summary</h2>
+    <p>Start Value: <b id="startVal">$0</b></p>
+    <p>End Value: <b id="endVal">$0</b></p>
+    <p>Net Flow: <b id="flowVal">$0</b></p>
+    <p>Market Growth: <b id="growthVal">$0</b></p>
+  </div>
+
+  <div class="card">
+    <h2>Holdings</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Symbol</th>
+          <th>Start</th>
+          <th>End</th>
+          <th>Buys</th>
+          <th>Sells</th>
+          <th>Growth</th>
+        </tr>
+      </thead>
+      <tbody id="tableBody"></tbody>
+    </table>
+  </div>
+</main>
+
+<script>
+/** Always bind buttons (so UI never "does nothing") **/
+const $ = id => document.getElementById(id);
+const fmt = n => Number.isFinite(n) ? n.toLocaleString(undefined,{style:"currency",currency:"USD"}) : "$0";
+
+let snapshots = [];         // array of Map(symbol -> value)
+let transactions = new Map(); // Map(symbol -> {buys, sells})
+
+function addWarning(msg){
+  const w = $("warnings");
+  w.textContent = (w.textContent ? w.textContent + "\n" : "") + msg;
+}
+function setStatus(s){ $("status").textContent = s; }
+
+function resetAll(){
+  snapshots = [];
+  transactions = new Map();
+  $("warnings").textContent = "";
+  $("tableBody").innerHTML = "";
+  $("startVal").textContent = "$0";
+  $("endVal").textContent = "$0";
+  $("flowVal").textContent = "$0";
+  $("growthVal").textContent = "$0";
+  setStatus("Waiting…");
+}
+
+$("resetBtn").onclick = resetAll;
+
+/** Load PDF.js dynamically (non-module) **/
+function loadScript(src){
+  return new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = src;
+    s.onload = resolve;
+    s.onerror = () => reject(new Error("Failed to load " + src));
+    document.head.appendChild(s);
+  });
+}
+
+async function ensurePdfJs(){
+  if (window.pdfjsLib) return window.pdfjsLib;
+
+  // Try jsDelivr first (often not blocked)
+  try {
+    await loadScript("https://cdn.jsdelivr.net/npm/pdfjs-dist@4.0.379/build/pdf.min.js");
+  } catch (e1) {
+    // Fallback to cdnjs
+    await loadScript("https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.0.379/pdf.min.js");
+  }
+
+  if (!window.pdfjsLib) throw new Error("pdfjsLib did not initialize (network blocker / CSP?)");
+
+  // Configure worker (try both CDNs)
+  window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+    "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.0.379/build/pdf.worker.min.js";
+
+  return window.pdfjsLib;
+}
+
+/** CSV parsing **/
+function parseCsv(text){
+  const parsed = Papa.parse(text, { header:true, skipEmptyLines:true });
+  const rows = parsed.data || [];
+  for (const r of rows){
+    const sym = String(r.Symbol || r.Ticker || r.Security || "").trim().toUpperCase();
+    if (!sym) continue;
+
+    const action = String(r.Action || r.Type || r.Description || "").toLowerCase();
+    const amtRaw = r.Amount ?? r["Net Amount"] ?? r.Total ?? r.Value ?? r.Principal;
+    const amt = Number(String(amtRaw ?? "").replace(/[$,()]/g,"").trim());
+    if (!Number.isFinite(amt)) continue;
+
+    if (!transactions.has(sym)) transactions.set(sym, {buys:0, sells:0});
+    if (action.includes("buy")) transactions.get(sym).buys += Math.abs(amt);
+    else if (action.includes("sell")) transactions.get(sym).sells += Math.abs(amt);
+  }
+}
+
+/** PDF holdings parsing **/
+async function parsePdfHoldings(file, pdfjsLib){
+  const buf = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+
+  const holdings = new Map();
+
+  for (let p=1; p<=pdf.numPages; p++){
+    const page = await pdf.getPage(p);
+    const txt = await page.getTextContent();
+
+    // Minimal heuristic to prove parsing works:
+    // look for tokens containing "(TICKER)" and a numeric at end of same token.
+    for (const it of txt.items){
+      const s = String(it.str || "").trim();
+      const m = s.match(/\(([A-Z0-9.\-]{1,10})\).*?(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)\s*$/);
+      if (!m) continue;
+      const sym = m[1];
+      const val = Number(m[2].replace(/,/g,""));
+      if (!Number.isFinite(val)) continue;
+      holdings.set(sym, (holdings.get(sym) || 0) + val);
+    }
+  }
+
+  return holdings;
+}
+
+/** Merge + render **/
+function render(){
+  const tbody = $("tableBody");
+  tbody.innerHTML = "";
+
+  if (snapshots.length < 2){
+    addWarning("Tip: upload 2 statements (start + end) to compute growth.");
+    return;
+  }
+
+  const start = snapshots[0];
+  const end = snapshots[snapshots.length-1];
+
+  const syms = new Set([...start.keys(), ...end.keys(), ...transactions.keys()]);
+
+  let sTot=0, eTot=0, fTot=0, gTot=0;
+
+  for (const sym of syms){
+    const s = start.get(sym) || 0;
+    const e = end.get(sym) || 0;
+    const t = transactions.get(sym) || {buys:0, sells:0};
+    const flow = t.buys - t.sells;
+    const g = e - s - flow;
+
+    sTot += s; eTot += e; fTot += flow; gTot += g;
+
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${sym}</td>
+      <td>${fmt(s)}</td>
+      <td>${fmt(e)}</td>
+      <td>${fmt(t.buys)}</td>
+      <td>${fmt(t.sells)}</td>
+      <td>${fmt(g)}</td>
+    `;
+    tbody.appendChild(tr);
+  }
+
+  $("startVal").textContent = fmt(sTot);
+  $("endVal").textContent = fmt(eTot);
+  $("flowVal").textContent = fmt(fTot);
+  $("growthVal").textContent = fmt(gTot);
+}
+
+/** Process button **/
+$("processBtn").onclick = async () => {
+  $("warnings").textContent = "";
+  setStatus("Processing…");
+
+  snapshots = [];
+  transactions = new Map();
+
+  const files = [...$("fileInput").files];
+  if (!files.length){
+    setStatus("No files selected");
+    return;
+  }
+
+  let pdfCount=0, csvCount=0;
+
+  // Load PDF.js only if needed
+  const needPdf = files.some(f => (f.type || "").toLowerCase() === "application/pdf" || (f.name||"").toLowerCase().endsWith(".pdf"));
+
+  let pdfjsLib = null;
+  if (needPdf){
+    try {
+      pdfjsLib = await ensurePdfJs();
+      console.log("pdfjsLib ready", pdfjsLib?.version || "");
+    } catch (e) {
+      addWarning("PDF.js failed to load. This is usually due to an adblocker or corporate network blocking CDNs.");
+      addWarning(String(e?.message || e));
+      setStatus("Done (PDF blocked, CSV processed if any)");
+    }
+  }
+
+  // PDFs
+  for (const f of files){
+    const name = (f.name || "").toLowerCase();
+    const type = (f.type || "").toLowerCase();
+    const isPdf = type === "application/pdf" || name.endsWith(".p
