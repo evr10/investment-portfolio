@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Investment Portfolio Overview</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- CSV parsing -->
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+  <!-- Charts (optional; not used below but safe to keep) -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+
+  <style>
+    body { margin:0; background:#0b1020; color:#e8ecff; font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial; }
+    header { padding:20px; border-bottom:1px solid #27325f; }
+    main { max-width:1200px; margin:auto; padding:20px; }
+    .card { background:#121a33; border:1px solid #27325f; border-radius:14px; padding:16px; margin-bottom:16px; }
+    button { background:#0f1630; color:#e8ecff; border:1px solid #27325f; border-radius:10px; padding:10px 14px; cursor:pointer; }
+    button:hover { border-color:#7aa2ff; }
+    input[type=file] { width:100%; padding:10px; background:#0f1630; color:#a7b0d6; border-radius:10px; border:1px dashed #27325f; }
+    table { width:100%; border-collapse:collapse; margin-top:10px; }
+    th, td { padding:8px; border-bottom:1px solid #27325f; font-size:12px; text-align:right; white-space:nowrap; }
+    th:first-child, td:first-child { text-align:left; }
+    .pill { display:inline-block; padding:4px 10px; border-radius:999px; border:1px solid #27325f; font-size:12px; margin-left:10px; }
+    .warn { color:#ffd27a; font-size:12px; white-space:pre-wrap; margin-top:10px; }
+  </style>
+</head>
+
+<body>
+<header>
+  <h1>Investment Portfolio Overview</h1>
+  <p>Upload PDF statements (holdings only) and CSV transactions. All processing stays in your browser.</p>
+</header>
+
+<main>
+  <div class="card">
+    <h2>Upload</h2>
+    <input id="fileInput" type="file" multiple accept=".pdf,.csv" />
+    <br /><br />
+    <button id="processBtn">Process uploads</button>
+    <button id="resetBtn">Reset</button>
+    <span class="pill" id="status">Waiting…</span>
+    <div class="warn" id="warnings"></div>
+  </div>
+
+  <div class="card">
+    <h2>Summary</h2>
+    <p>Start Value: <b id="startVal">$0</b></p>
+    <p>End Value: <b id="endVal">$0</b></p>
+    <p>Net Flow: <b id="flowVal">$0</b></p>
+    <p>Market Growth: <b id="growthVal">$0</b></p>
+  </div>
+
+  <div class="card">
+    <h2>Holdings</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Symbol</th>
+          <th>Start</th>
+          <th>End</th>
+          <th>Buys</th>
+          <th>Sells</th>
+          <th>Growth</th>
+        </tr>
+      </thead>
+      <tbody id="tableBody"></tbody>
+    </table>
+  </div>
+</main>
+
+<!-- ✅ Robust PDF.js load via ES module (no global pdfjsLib needed) -->
+<script type="module">
+  // Import PDF.js as a module (works even when globals are blocked)
+  import * as pdfjsLib from "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.0.379/build/pdf.min.mjs";
+
+  // Set the worker for PDF.js
+  pdfjsLib.GlobalWorkerOptions.workerSrc =
+    "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.0.379/build/pdf.worker.min.mjs";
+
+  console.log("PDF.js module loaded", pdfjsLib?.version);
+
+  const $ = id => document.getElementById(id);
+  const fmt = n => Number.isFinite(n) ? n.toLocaleString(undefined,{style:"currency",currency:"USD"}) : "$0";
+
+  let snapshots = [];     // array of Map(symbol -> value)
+  let transactions = new Map(); // Map(symbol -> {buys, sells})
+
+  function addWarning(msg){
+    const w = $("warnings");
+    w.textContent = (w.textContent ? w.textContent + "\n" : "") + msg;
+  }
+
+  /* ---------- CSV (transactions) ---------- */
+  function parseCsv(text) {
+    const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
+    const rows = parsed.data || [];
+
+    for (const r of rows) {
+      const sym = String(r.Symbol || r.Ticker || r.Security || "").trim().toUpperCase();
+      if (!sym) continue;
+
+      const action = String(r.Action || r.Type || r.Description || "").toLowerCase();
+
+      const amtRaw = r.Amount ?? r["Net Amount"] ?? r.Total ?? r.Value ?? r.Principal;
+      const amt = Number(String(amtRaw ?? "").replace(/[$,()]/g,"").trim());
+      if (!Number.isFinite(amt)) continue;
+
+      if (!transactions.has(sym)) transactions.set(sym, { buys:0, sells:0 });
+
+      if (action.includes("buy")) transactions.get(sym).buys += Math.abs(amt);
+      else if (action.includes("sell")) transactions.get(sym).sells += Math.abs(amt);
+    }
+  }
+
+  /* ---------- PDF (holdings only) ---------- */
+  async function parsePdf(file) {
+    const buf = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+
+    const holdings = new Map();
+
+    for (let p = 1; p <= pdf.numPages; p++) {
+      const page = await pdf.getPage(p);
+      const txt = await page.getTextContent();
+
+      // Simple heuristic:
+      // Look for lines containing "(TICKER)" and a trailing money value.
+      // This may need refining for your statement; but first we must get PDF.js loading.
+      for (const it of txt.items) {
+        const s = String(it.str || "").trim();
+        const m = s.match(/\(([A-Z0-9.\-]{1,10})\).*?(\d{1,3}(?:,\d{3})*(?:\.\d{2})?)\s*$/);
+        if (!m) continue;
+        const sym = m[1];
+        const val = Number(m[2].replace(/,/g,""));
+        if (!Number.isFinite(val)) continue;
+        holdings.set(sym, (holdings.get(sym) || 0) + val);
+      }
+    }
+
+    r
